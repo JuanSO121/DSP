@@ -1,108 +1,182 @@
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
+import time
+import queue
 import threading
-from audio_operations import apply_noise_reduction, apply_equalizer
-
+from scipy import signal
 
 class AudioProcessor:
-    def __init__(self, fs=44100, duration=5):
-        self.fs = fs
-        self.duration = duration
+    def __init__(self):
         self.audio_data = None
         self.filtered_audio = None
-        self._stream = None
-        self._stream_thread = None
-        self._recorded = []
-        self._stop_monitor = threading.Event()
-
-    def record_audio(self):
-        print(f"Grabando audio por {self.duration} segundos...")
-        self.audio_data = sd.rec(int(self.duration * self.fs), samplerate=self.fs, channels=1)
-        sd.wait()
-        self.audio_data = self.audio_data.flatten()
-        sf.write('audio_original.wav', self.audio_data, self.fs)
-        print("Grabación completada y guardada como 'audio_original.wav'")
-        return self.audio_data
-
-    def load_audio(self, file_path):
+        self.fs = None
+        self.is_monitoring = False
+        self.monitor_thread = None
+        self.audio_buffer = None
+        self.buffer_size = 1024  # Tamaño del bloque para streaming
+        self.overlap = 256       # Solapamiento entre bloques
+        self.eq_processor = None
+        self.recording_buffer = []  # Para guardar el audio procesado
+        
+    def load_audio(self, filepath):
+        """Carga un archivo de audio"""
         try:
-            self.audio_data, new_fs = sf.read(file_path, always_2d=False)
-            self.fs = new_fs
+            self.audio_data, self.fs = sf.read(filepath)
+            
+            # Convertir a mono si es estéreo
             if len(self.audio_data.shape) > 1:
                 self.audio_data = np.mean(self.audio_data, axis=1)
-            print(f"Audio cargado desde {file_path}")
+                
+            # Normalizar el audio
+            self.audio_data = self.audio_data / np.max(np.abs(self.audio_data)) * 0.9
+            
+            # Reset del audio filtrado
+            self.filtered_audio = None
+            
             return self.audio_data
         except Exception as e:
-            print(f"Error al cargar el archivo: {e}")
+            print(f"Error al cargar el audio: {e}")
             return None
-
-    def play_audio(self, audio=None):
-        if audio is None:
-            audio = self.audio_data
-        if audio is not None:
-            sd.play(audio, self.fs)
-            sd.wait()
-        else:
-            print("No hay audio para reproducir.")
-
+    
     def reduce_noise(self, level=0.5):
-        if self.audio_data is not None:
-            self.filtered_audio = apply_noise_reduction(self.audio_data, self.fs, level)
-            return self.filtered_audio
-        else:
-            print("No hay audio cargado para reducir ruido.")
+        """Aplica reducción de ruido simple"""
+        from audio_operations import apply_noise_reduction
+        try:
+            if self.audio_data is not None:
+                self.filtered_audio = apply_noise_reduction(self.audio_data, self.fs, level)
+                return self.filtered_audio
             return None
-
-    def monitor_audio(self, eq_settings_getter, record=True):
-        self._recorded.clear()
-        self._stop_monitor.clear()
-
-        def callback(indata, outdata, frames, time, status):
+        except Exception as e:
+            print(f"Error en reducción de ruido: {e}")
+            return None
+            
+    def monitor_audio(self, get_eq_settings_callback):
+        """Monitorea el audio del micrófono y aplica procesamiento en tiempo real"""
+        if self.is_monitoring:
+            print("Ya está monitoreando")
+            return
+            
+        self.is_monitoring = True
+        self.recording_buffer = []  # Reiniciar buffer de grabación
+        
+        # Crear objetos para procesamiento
+        from audio_operations import EQProcessor
+        
+        # Configuración de audio
+        fs = 44100  # Frecuencia de muestreo
+        self.fs = fs
+        channels = 1  # Mono
+        
+        # Inicializar procesador EQ
+        self.eq_processor = EQProcessor(fs, self.buffer_size)
+        
+        # Cola para comunicación entre callbacks
+        q = queue.Queue(maxsize=10)
+        
+        # Configuración de streaming
+        stream_buffer = np.zeros(self.buffer_size + self.overlap)
+        output_buffer = np.zeros(self.buffer_size)
+        
+        def audio_callback(indata, outdata, frames, time, status):
+            """Callback para el streaming de audio"""
             if status:
-                print("Status:", status)
-            audio = indata[:, 0]
-
-            eq_settings = None
+                print(f"Error en stream: {status}")
+                
+            # Obtener configuración actual del EQ
+            current_eq_settings = get_eq_settings_callback()
+            if current_eq_settings:
+                self.eq_processor.configure(current_eq_settings)
+            
+            # Procesar audio de entrada (mono)
+            input_mono = indata[:, 0] if indata.shape[1] > 1 else indata.flatten()
+            
+            # Desplazar buffer y añadir nuevos datos
+            stream_buffer[:-frames] = stream_buffer[frames:]
+            stream_buffer[-frames:] = input_mono
+            
+            # Procesar bloque completo con EQ
+            processed = self.eq_processor.process_block(stream_buffer[-self.buffer_size:])
+            
+            # Añadir al buffer de grabación
+            self.recording_buffer.append(processed.copy())
+            
+            # Enviar a la salida (duplicar para estéreo)
+            if outdata.shape[1] > 1:
+                outdata[:] = np.column_stack([processed, processed])
+            else:
+                outdata[:] = processed.reshape(-1, 1)
+                
+            # Enviar a la cola para visualización si es necesario
             try:
-                if eq_settings_getter:
-                    eq_settings = eq_settings_getter()
-            except Exception as e:
-                print("Error obteniendo EQ settings:", e)
-
-            if eq_settings:
-                audio = apply_equalizer(audio, self.fs, eq_settings)
-
-            outdata[:, 0] = audio
-
-            if record:
-                self._recorded.append(audio.copy())
-
-            if self._stop_monitor.is_set():
-                raise sd.CallbackStop()
-
-        self._stream = sd.Stream(
-            samplerate=self.fs,
-            blocksize=4096,
-            latency='high',
-            dtype='float32',
-            channels=1,
-            callback=callback
-        )
-
-        def run_stream():
-            with self._stream:
-                sd.sleep(100000)
-
-        self._stream_thread = threading.Thread(target=run_stream)
-        self._stream_thread.daemon = True
-        self._stream_thread.start()
-        print("Monitoreo iniciado.")
-
+                q.put_nowait(processed)
+            except queue.Full:
+                pass
+        
+        # Iniciar stream
+        try:
+            self.audio_stream = sd.Stream(
+                samplerate=fs,
+                blocksize=self.buffer_size,
+                channels=2,  # Estéreo para salida
+                dtype='float32',
+                callback=audio_callback
+            )
+            
+            self.audio_stream.start()
+            
+            # Iniciar thread para grabación
+            self.monitor_thread = threading.Thread(target=self._monitor_worker, args=(q,))
+            self.monitor_thread.daemon = True
+            self.monitor_thread.start()
+            
+        except Exception as e:
+            self.is_monitoring = False
+            print(f"Error al iniciar monitoreo: {e}")
+    
+    def _monitor_worker(self, q):
+        """Worker thread para monitoreo"""
+        try:
+            while self.is_monitoring:
+                time.sleep(0.1)  # Pequeña pausa para evitar consumo excesivo de CPU
+        except Exception as e:
+            print(f"Error en monitor worker: {e}")
+        finally:
+            # Limpiar al finalizar
+            while not q.empty():
+                q.get()
+    
     def stop_monitoring(self):
-        self._stop_monitor.set()
-        print("Monitoreo detenido.")
-        if self._recorded:
-            audio_full = np.concatenate(self._recorded)
-            sf.write('audio_monitoreado.wav', audio_full, self.fs)
-            print("Audio guardado como 'audio_monitoreado.wav'")
+        """Detiene el monitoreo y guarda el audio procesado"""
+        if not self.is_monitoring:
+            return
+            
+        self.is_monitoring = False
+        
+        try:
+            # Detener stream
+            self.audio_stream.stop()
+            self.audio_stream.close()
+            
+            # Esperar a que el thread termine
+            if self.monitor_thread and self.monitor_thread.is_alive():
+                self.monitor_thread.join(timeout=1.0)
+            
+            # Guardar audio procesado
+            if self.recording_buffer:
+                # Convertir lista de buffers a un array continuo
+                recorded_audio = np.concatenate(self.recording_buffer)
+                
+                # Normalizar
+                max_amp = np.max(np.abs(recorded_audio))
+                if max_amp > 0:
+                    recorded_audio = recorded_audio / max_amp * 0.9
+                
+                # Guardar como WAV
+                sf.write('audio_procesado.wav', recorded_audio, self.fs)
+                
+                # También guardarlo como audio filtrado para reproducción
+                self.filtered_audio = recorded_audio
+                
+        except Exception as e:
+            print(f"Error al detener monitoreo: {e}")
